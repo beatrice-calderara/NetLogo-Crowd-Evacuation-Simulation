@@ -1,0 +1,2232 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="false">
+  <code><![CDATA[extensions [bitmap rnd]
+breed [fire-turtles fire-turtle]
+breed [people person]
+
+
+; --- GLOBAL ATTRIBUTES ---
+globals [
+  alarm?                   ; true when evacuation alarm has been triggered
+  people_left              ; number of people still alive in the simulation
+  time_of_evacuation       ; tick counter that starts when alarm is triggered
+  max_people_on_patch      ; maximum number of people allowed on a single walkable patch
+  max_people_on_patch_exit ; maximum number of people allowed on a single exit patch
+  injury_levels_histogram  ; list collecting injury levels of evacuated people, used for plotting
+
+  
+  ; --- EXIT GATE PATCH-SETS ---
+  ; Each variable holds the set of patches belonging to that specific gate.
+  ; Pre-built in draw_map_SC and never modified afterwards.
+  S_gate   ; south gate
+  SW_gate  ; south-west gate
+  SE_gate  ; south-east gate
+  N_gate   ; north gate (only active when real_exits is false)
+  NW_gate  ; north-west gate
+  NE_gate  ; north-east gate
+
+  
+  ; --- INJURY LEVEL COUNTERS ---
+  ; Track how many evacuated people reached each injury level.
+  ; Updated in update_injury_output when a person successfully exits.
+  il0  ; healthy   (injury level 0)
+  il1  ; minor     (injury level 1)
+  il2  ; moderate  (injury level 2)
+  il3  ; serious   (injury level 3)
+  il4  ; severe    (injury level 4)
+  il5  ; critical  (injury level 5)
+  ; Note: fatal (level 6) people never evacuate, so no il6 counter is needed
+
+  
+  ; --- FIRE SYSTEM GLOBALS ---
+  fire_active?     ; true once ignite_fire has been called; gates spread_fire every tick
+  all_gates        ; union of all gate patch-sets, pre-computed once in setup to avoid repeated runtime scans of the full patch grid
+  white_patches    ; all walkable (white) patches, pre-computed once in setup
+  fire_candidates  ; subset of white_patches far from exits, pre-computed in setup so that ignite_fire requires zero runtime computation
+  fire_patches     ; agentset of patches currently on fire, grows incrementally as fire spreads — never rebuilt from scratch
+  fire_origin      ; the patch where the fire was first ignited, used to enforce the maximum spread radius (hardcoded to 50 units)
+
+]
+
+
+
+; --- PERSON ATTRIBUTES ---
+people-own[
+  speed            ; movement steps per tick, varies with injury level, age and gender
+  destination      ; target exit patch the person is heading toward
+  health_state     ; numeric health value in range [0, 100]; decreases due to crowding, fire exposure and smoke inhalation
+  injury_level     ; discrete injury severity in range [0, 6] derived from health_state
+                   ; 0=healthy 1=minor 2=moderate 3=serious 4=severe 5=critical 6=fatal
+  evac_time        ; timer value recorded when the person successfully exits the arena
+  direction_to_go  ; random walk direction during pre-alarm phase ("left" or "right")
+  rational         ; T/F — if true the person makes goal-directed decisions; if false they follow the crowd (overridden by panic)
+  panic            ; T/F — if true the person probabilistically loses rationality
+  panic_percentage ; probability in range (0, 0.75] of irrational behavior when panicking
+  aware            ; T/F — if true the person knows the arena layout and picks the nearest exit; also enables the deliberative BDI layer for fire avoidance
+  evacuated        ; T/F — set to true when the person steps onto an exit patch
+  escaping         ; T/F — set to true when the alarm triggers; gates movement toward exits
+  dead             ; T/F — set to true when injury_level reaches 6 (fatal)
+  age              ; demographic category: C = child / A = adult / E = elderly
+                   ; affects speed penalty and injury weight multiplier
+  gender            ; M = male / F = female — female agents have a speed penalty of 1
+]
+
+
+; --- PEATCHES ATTRIBUTES ---
+; Each patch represents approximately one square meter of arena floor.
+patches-own [
+  num_people   ; number of alive people currently standing on this patch; used to enforce max_people_on_patch crowding threshold
+  on_fire?     ; true if this patch is actively burning; set by ignite_fire and spread_fire, never reset during a run
+  smoke_level  ; local smoke density, range [0, smoke_radius]; computed by diffusion in spread_fire every 3 ticks
+  base_pcolor  ; snapshot of the original patch color taken at end of draw_map_SC;
+               ; used by all movement logic so that smoke/fire visualization changes to pcolor never break collision and exit detection
+]
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: draw_map_SC
+; Procedurally draws the arena map using patch coloring.
+; Color convention:
+;   WHITE  — walkable interior floor
+;   BLACK  — walls and exterior (impassable)
+;   RED    — exit gates (evacuation targets)
+;   GRAY   — central statue obstacle
+;
+; The arena dimensions are scaled by the global slider "scale".
+; Wall thickness is controlled by the global slider "wall-thickness".
+; The north gate is only painted when real_exits is false (symmetric scenario).
+;
+; At the end, base_pcolor is snapshotted for every patch so that fire/smoke visualization can alter pcolor freely without breaking the movement logic that relies on original patch colors.
+; ---------------------------------------------------------------------------
+to draw_map_SC
+
+  set N_gate no-patches
+  set S_gate no-patches
+  set SE_gate no-patches
+  set SW_gate no-patches
+  set NE_gate no-patches
+  set NW_gate no-patches
+
+  let halfW ((38 + wall-thickness) * scale)
+  let halfH ((84 + wall-thickness) * scale)
+  let margin (1 * scale)
+
+  resize-world (- halfW - margin) (halfW + margin) (- halfH - margin) (halfH + margin)
+  set-patch-size 1
+
+  ask patches [
+    ; default: everything is outside / wall
+    set pcolor black
+
+    ; internal walkable area
+    if (abs pxcor / scale < 38) and (abs pycor / scale < 84) [
+      set pcolor white
+    ]
+
+    ; S EXIT
+    if ((pycor / scale <= -84) and (pycor / scale >= -84 - wall-thickness) and
+        (pxcor / scale <= 5.4) and (pxcor / scale >= -5.4)) [
+      set pcolor red
+      set S_gate (patch-set S_gate self)
+    ]
+
+    ; N EXIT
+    if ((pycor / scale >= 84) and (pycor / scale <= 84 + wall-thickness) and
+        (pxcor / scale <= 6.1) and (pxcor / scale >= -6.1) and
+        (not real_exits)) [
+      set pcolor red
+      set N_gate (patch-set N_gate self)
+    ]
+
+    ; SE EXIT
+    if ((pxcor / scale >= 38) and (pxcor / scale <= 38 + wall-thickness) and
+        (pycor / scale > -84) and (pycor / scale <= -73)) [
+      set pcolor red
+      set SE_gate (patch-set SE_gate self)
+    ]
+
+    ; SW EXIT
+    if ((pxcor / scale <= -38) and (pxcor / scale >= -38 - wall-thickness) and
+        (pycor / scale > -84) and (pycor / scale <= -73)) [
+      set pcolor red
+      set SW_gate (patch-set SW_gate self)
+    ]
+
+    ; NE EXIT
+    if ((pxcor / scale >= 38) and (pxcor / scale <= 38 + wall-thickness) and
+        (pycor / scale >= 73) and (pycor / scale < 84)) [
+      set pcolor red
+      set NE_gate (patch-set NE_gate self)
+    ]
+
+    ; NW EXIT
+    if ((pxcor / scale <= -38) and (pxcor / scale >= -38 - wall-thickness) and
+        (pycor / scale >= 73) and (pycor / scale < 84)) [
+      set pcolor red
+      set NW_gate (patch-set NW_gate self)
+    ]
+
+    ; statue
+    if (abs pycor / scale <= 6.25) and (abs pxcor / scale <= 5) [
+      set pcolor gray
+    ]
+  ]
+
+  ask patches [ set base_pcolor pcolor ]
+end
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: setup
+; Initializes the entire simulation from scratch.
+; Draws the arena map, pre-computes static agentsets for performance, spawns the population with demographic attributes, and resets all counters and fire system variables.
+; Must be called before start_simulation or start_evacuation.
+; ---------------------------------------------------------------------------
+to setup
+  clear-all
+  reset-ticks
+  random-seed 42
+  
+  ; Draw the arena: walls, exits, obstacle and exterior
+  draw_map_SC 
+
+  
+  ; Pre compute static agent sets. 
+  ; The map geometry never changes during a run, so these are built once here and reused everywhere to avoid expensive runtime patch scans.
+  set all_gates     (patch-set S_gate SW_gate SE_gate N_gate NW_gate NE_gate)
+  set white_patches patches with [pcolor = white]
+  
+  
+  ; Fire candidates: white patches used by ignite_fire to place the fire origin away from evacuation routes
+  set fire_candidates white_patches with [
+    (min [distance myself] of all_gates) > 20
+  ]
+  if not any? fire_candidates [
+    set fire_candidates white_patches
+  ]
+  
+  
+  ; All people start as healthy adult males facing a random direction.
+  ; Demographic attributes (gender, age, panic, awareness) are assigned afterwards as random subsets of the population.
+  create-people population [
+    set color rgb 0 255 0
+    set shape "person"
+    set size people_dim
+    set speed 1
+    set rational true
+    set panic false
+    set panic_percentage 0
+    set aware false
+    set escaping false
+    set evacuated false
+    set dead false
+    set health_state 100
+    set gender "M"
+    set age "A"
+    move-to one-of white_patches 
+  ]
+
+  
+  ; Counters and flags 
+  set il0 0
+  set il1 0
+  set il2 0
+  set il3 0
+  set il4 0
+  set il5 0
+  set injury_levels_histogram []
+  set alarm? false
+  set max_people_on_patch 10
+  ifelse real_exits [set max_people_on_patch_exit max_people_on_patch] [set max_people_on_patch_exit 2]
+  set time_of_evacuation 0
+  
+  ; Demographic assignemnt. 
+  ; Subsets of the population are flagged according to interface slider fractions. 
+  ask n-of (round aware_fraction / 100 * population) people [set aware true]
+  ask n-of (round panic_fraction / 100 * population) people [set panic true]
+  ask n-of (round female_fraction / 100 * population) people [set gender "F"]
+  ask n-of (round children_fraction / 100 * population) people [set age "C"]
+  ask n-of (round elderly_fraction / 100 * population) people [set age "E"]
+  ask people with [panic = true] [set panic_percentage random-float 0.75]
+
+  
+  ; Fire system initialization
+  set fire_active? false
+  ask patches [
+    set on_fire?    false
+    set smoke_level 0
+  ]
+  
+  set fire_patches no-patches
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: start_simulation
+; Main simulation loop — called every tick by the "Start Simulation" button.
+; Handles three distinct phases in order:
+;   1. Pre-alarm: people wander randomly until the alarm is triggered
+;   2. Evacuation: people move toward exits, with panic and rational variants
+;   3. Fire: fire is ignited after fire_delay ticks and spreads each tick
+; ---------------------------------------------------------------------------
+to start_simulation
+  
+  ; --- PHASE 1: PRE-ALARM RANDOM MOVEMENT ---
+  ; Before the alarm, people perform a weighted random walk (left or right).
+  ; They only step forward if the next patch is a walkable floor patch.
+  if (alarm? = false) [
+    ask people [
+      let items ["left" "right"]
+      let probabilities [0.5 0.5]
+      let pairs (map list items probabilities)
+      set direction_to_go first rnd:weighted-one-of-list pairs last
+      ifelse (direction_to_go = "right")
+        [right random 45]
+        [left random 45]
+      if [base_pcolor] of patch-ahead 1 = white [forward 1] ; MODIFIED: base_pcolor
+    ]
+  ]
+
+  
+  ; --- TERMINATION CHECK ---
+  ; Stop the simulation when every person still alive has died.
+  if ((count people) = (count people with [dead]) and alarm? = true) [set alarm? false stop]
+
+  
+  ; --- PHASE 2: EVACUATION MOVEMENT ---
+  ; Rational (non-panicking) people call move_forward, which applies both the deliberative BDI layer (fire rerouting) and the reactive layer (step avoidance).
+  ask people with [escaping = true and health_state > 0 and panic = false] [
+    update_people_status
+    if not dead [ move_forward ]
+  ]
+  
+  ; Panicking people probabilistically switch between rational and irrational behavior.
+  ; Rational ticks: move normally and reset panic.
+  ; Irrational ticks: follow the crowd (follow_crowd procedure).
+  ask people with [escaping = true and health_state > 0 and panic = true] [
+    update_people_status
+    if not dead [
+      let items [false true]
+      let p panic_percentage
+      let probabilities list (p) (1 - p)
+      let pairs (map list items probabilities)
+      set rational first rnd:weighted-one-of-list pairs last
+      ifelse (rational = true)
+        [move_forward
+         set panic false]
+        [follow_crowd]
+    ]
+  ]
+
+  
+  ; --- PHASE 3: FIRE SYSTEM ---
+  ; Ignition: triggered once when all four conditions are met simultaneously.
+  if (fire_hazard_enabled) and (alarm?) and (not fire_active?) and
+     (time_of_evacuation >= fire_delay) [
+    ignite_fire
+  ]
+  
+  if fire_active? [ spread_fire ]   ; Propagate fire if already active
+
+  
+  if alarm? [ set time_of_evacuation time_of_evacuation + 1 ]
+  ask patches [set num_people count people-here with [not dead]]
+  set people_left count people
+  tick
+end
+
+to start_evacuation
+  set alarm? true
+  reset-timer
+  ask people [
+    set escaping true
+    ifelse (aware = true)
+      [set destination one-of get_patch_set min-one-of all_gates [distance myself]] 
+      [set destination one-of all_gates]                                             
+    face destination
+  ]
+end
+
+
+
+; ---------------------------------------------------------------------------
+; REPORTER: get_patch_set [p]
+; Given a single patch p, returns the full gate agentset that p belongs to.
+; Used in start_evacuation so that aware people are assigned a destination drawn from the entire gate group, not just a single patch.
+; ---------------------------------------------------------------------------
+to-report get_patch_set [p]
+  (
+    ifelse member? p NE_gate [report NE_gate]
+           member? p NW_gate [report NW_gate]
+           member? p SW_gate [report SW_gate]
+           member? p SE_gate [report SE_gate]
+           member? p S_gate  [report S_gate]
+           member? p N_gate  [report N_gate]
+  )
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: move_person
+; Moves the calling person agent one step toward their destination exit.
+; Handles all terrain cases: free floor, crowded floor, free exit, crowded exit, wall and obstacle.
+;
+; IMPORTANT: do not call this procedure directly.
+;            Always call move_forward, which applies speed, slip and the deliberative BDI layer before entering the movement loop.
+;
+; Movement priority (evaluated top to bottom):
+;   0. If already evacuated → record injury and remove from simulation
+;   1. REACTIVE LAYER: if next patch is on fire → detour to safe neighbor
+;   2. Next patch is free floor → step forward
+;   3. Next patch is crowded floor → detour to least-congested neighbor
+;   4. Next patch is free exit → step through, mark as evacuated
+;   5. Next patch is crowded exit → reroute to a less congested exit
+;   6. Next patch is a wall → try nearby exit or free neighbor, else reroute
+;   7. Next patch is the statue obstacle → pick a new exit and try to move
+; ---------------------------------------------------------------------------
+to move_person
+  
+  ; Case 0: person has already crossed an exit patch in a previous step
+  ; Record their final injury level and remove them from the simulation.
+  if evacuated [update_injury_output die]
+  if evacuated [update_injury_output die]
+
+  ; ---------------------------------------------------------------
+  ; REACTIVE LAYER (all agents, regardless of awareness or panic)
+  ; Pure stimulus-response: if the very next patch is burning, do not enter it. Find the safest accessible neighbor instead.
+  ; This layer has priority over all destination-directed movement below.
+  ; ---------------------------------------------------------------
+  if fire_active? and [on_fire?] of patch-ahead 1 [
+    let safe-neighbors neighbors with [
+      base_pcolor = white and
+      not on_fire? and
+      num_people < max_people_on_patch
+    ]
+    ifelse any? safe-neighbors [
+      ; Step toward the safe neighbor that keeps the person closest to their destination
+      face min-one-of safe-neighbors [distance [destination] of myself]
+      forward 1
+      face destination
+    ][
+      ; No safe neighbors available: stay in place and reface destination
+      face destination
+    ]
+    stop  ; skip the rest of move_person this tick
+  ]
+  
+  (ifelse
+    ; Case 2: next patch is free walkable floor — simply advance
+    [base_pcolor = white and num_people < max_people_on_patch] of patch-ahead 1
+      [forward 1]
+
+    ; Case 3: next patch is walkable but overcrowded — detour via least-congested neighbor
+    [base_pcolor = white and num_people >= max_people_on_patch] of patch-ahead 1
+      [
+        face min-one-of neighbors with [(base_pcolor = white)] [distance [destination] of myself]
+        forward 1
+        face destination
+      ]
+
+    ; Case 4: next patch is an exit and not overcrowded — cross and mark as evacuated
+    [base_pcolor = red and num_people < max_people_on_patch_exit] of patch-ahead 1
+      [
+        forward 1
+        set evacuated true
+        set evac_time timer
+      ]
+
+    ; Case 5: next patch is an exit but overcrowded — reroute to a less congested gate
+    [base_pcolor = red and num_people >= max_people_on_patch_exit] of patch-ahead 1
+      [
+        set destination min-one-of all_gates with [num_people < max_people_on_patch_exit] [distance myself]
+        if any? neighbors with [(base_pcolor = white) and num_people < max_people_on_patch] [
+          face min-one-of neighbors with [(base_pcolor = white) and num_people < max_people_on_patch] [distance [destination] of myself]
+          forward 1
+          face destination
+        ]
+      ]
+
+    ; Case 6: next patch is a wall
+    [base_pcolor] of patch-ahead 1 = black
+      [
+        (ifelse any? neighbors with [(base_pcolor = red) and num_people < max_people_on_patch_exit] ; 6a: an uncrowded exit is adjacent — go through it immediately
+          [
+            face min-one-of neighbors with [base_pcolor = red] [distance [destination] of myself]
+            forward 1
+            set evacuated true
+            set evac_time timer
+          ]
+          any? neighbors with [(base_pcolor = white) and num_people < max_people_on_patch]          ; 6b: a free floor patch is adjacent — step sideways along the wall
+          [
+            face min-one-of neighbors with [base_pcolor = white] [distance [destination] of myself]
+            forward 1
+            face destination
+          ]
+          ; 6c: completely blocked — reassign destination to the nearest uncrowded exit
+          [
+            set destination min-one-of all_gates with [num_people < max_people_on_patch_exit] [distance [destination] of myself]
+          ]
+        )
+      ]
+    
+     ; Case 7: next patch is the central statue obstacle — pick a new exit and try to advance
+    [base_pcolor = gray] of patch-ahead 1
+      [
+        set destination one-of all_gates ; MODIFIED: all_gates
+        face destination
+        if [(base_pcolor = white) and num_people < max_people_on_patch] of patch-ahead 1 [forward 1]
+      ]
+  )
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: update_people_status
+; Called every tick for each active person during evacuation.
+; Updates health, injury level, visual color and movement speed in sequence.
+; The order matters: health must be updated before injury level, and injury level must be updated before speed.
+; ---------------------------------------------------------------------------
+to update_people_status
+  let n count (people-on patch-here) with [not dead]
+  set health_state update_hs n
+  if health_state < 0 [set health_state 0]
+  update_injury_level
+  (
+    ifelse injury_level = 6 [set dead true set color rgb 255 0 0          ; fatal   — red         
+                             set injury_levels_histogram fput injury_level injury_levels_histogram]
+           injury_level = 5 [set color rgb 255 102 0]                     ; critical — dark orange
+           injury_level = 4 [set color rgb 255 204 0]                     ; severe   — yellow
+           injury_level = 3 [set color rgb 0 153 255]                     ; serious  — blue
+           injury_level = 2 [set color rgb 0 255 255]                     ; moderate — cyan
+           injury_level = 1 [set color rgb 153 255 102]                   ; minor    — light green
+           injury_level = 0 [set color rgb 0 255 0]                       ; healthy  — green
+  )
+  update_speed
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: update_injury_level
+; Derives the discrete AIS injury level (0–6) from the current health_state.
+; The mapping is linear: each 15-point drop in health advances one level.
+;   health 100–85 → level 0 (healthy)
+;   health  84–70 → level 1 (minor)
+;   health  69–55 → level 2 (moderate)
+;   health  54–40 → level 3 (serious)
+;   health  39–25 → level 4 (severe)
+;   health  24–10 → level 5 (critical)
+;   health   9–0  → level 6 (fatal)
+;
+; Fatal is irreversible: once injury_level reaches 6 it stays at 6 forever, regardless of any subsequent health fluctuations.
+; ---------------------------------------------------------------------------
+to update_injury_level
+  if injury_level = 6 [ stop ]
+  set injury_level max list (6 - (floor (health_state / 15))) 0
+  
+end
+
+
+; ---------------------------------------------------------------------------
+; REPORTER: update_hs [n]
+; Returns the new health_state after applying crowding damage for this tick.
+; Damage per tick = (n - 1) × injury_weight, where n is the number of alive people on the same patch (the person itself does not count).
+; Age multipliers reflect higher physiological vulnerability:
+;   Adult   → base damage × 1
+;   Elderly → base damage × 2
+;   Child   → base damage × 3
+; ---------------------------------------------------------------------------
+to-report update_hs [n]
+  (
+    ifelse age = "A" [report health_state - ((n - 1) * injury_weight)]
+           age = "E" [report health_state - ((n - 1) * injury_weight * 2)]
+           age = "C" [report health_state - ((n - 1) * injury_weight * 3)]
+  )
+end
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: update_speed
+; Sets the person's movement speed (steps per tick) based on injury level.
+; Base speeds decrease with injury severity, then penalties are applied for age (elderly −3, child −2) and gender (female −1).
+; A minimum speed of 1 is enforced for non-fatal injuries to prevent complete immobility before death.
+; ---------------------------------------------------------------------------
+to update_speed
+  (
+    ifelse injury_level = 6 [set speed 0]   ; fatal    — immobile
+           injury_level = 5 [set speed 1]   ; critical
+           injury_level = 4 [set speed 2]   ; severe
+           injury_level = 3 [set speed 3]   ; serious
+           injury_level = 2 [set speed 4]   ; moderate
+           injury_level = 1 [set speed 5]   ; minor
+           injury_level = 0 [set speed 5]   ; healthy
+  )
+  
+  ; Age penalty — elderly and children are slower
+  (
+    ifelse age = "E" [set speed speed - 3]
+           age = "C" [set speed speed - 2]
+  )
+  
+  ; Gender penalty — female agents move slightly slower
+  if gender = "F" [set speed speed - 1]
+  
+  ; Enforce minimum speed: injured but alive people can always take at least 1 step
+  if (speed <= 0) and (injury_level < 6) [set speed 1]
+  ; Fatal agents are fully immobile
+  if (speed < 0)  and (injury_level = 6) [set speed 0]
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: deliberative_reroute
+; Implements the deliberative layer of the BDI architecture for aware agents.
+; Re-evaluates the current destination every 5 ticks using a cost function that balances evacuation efficiency against fire safety.
+;
+; Only aware agents have an active deliberative layer — unaware and panicking agents rely exclusively on the reactive layer in move_person.
+;
+; Cost function (minimized over all exits):
+;   cost(gate) = dist(agent → gate) − safety_weight × min_dist(gate → fire)
+; A higher safety_weight makes the agent prefer exits farther from fire, even at the cost of a longer path.
+;
+; The agent only perceives fire within perception_radius patches, modeling bounded rationality: no agent has global map knowledge.
+; ---------------------------------------------------------------------------
+to deliberative_reroute
+  if not aware [ stop ]                  ; only aware agents have a deliberative layer
+  if not fire_active? [ stop ]           ; no fire present — no replanning needed
+  if (ticks mod 5 != 0) [ stop ]
+
+  ; Belief state: fire patches visible within the agent's perception radius
+  let perceived-fire patches in-radius perception_radius with [on_fire?]
+  if not any? perceived-fire [ stop ]     ; fire exists but is outside perception — no action
+
+  ; Evaluate all exits and pick the one with the lowest cost.
+  let best-exit min-one-of all_gates [
+    (distance myself) - (safety_weight * (min [distance myself] of perceived-fire))
+  ]
+
+  ; Update destination only if the best exit has changed
+  if best-exit != nobody and best-exit != destination [
+    set destination best-exit
+    face destination
+  ]
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: move_forward
+; Entry point for all person movement during evacuation.
+; Applies speed, slip check, health update and deliberative rerouting before entering the step-by-step movement loop.
+;
+; The person moves up to speed steps per tick, stopping early if they slip, die or complete evacuation mid-loop.
+; ---------------------------------------------------------------------------
+to move_forward
+  ; If speed_enabled is off, all people move at exactly 1 step per tick
+  if not speed_enabled [set speed 1]   
+  
+  ; Slip check: glass bottles on the ground may cause a fall
+  let slip false
+  if glass_bottles [set slip get_slip]
+  if slip [set health_state health_state - (health_state / 20)]     ; A slip reduces health by 5% of current value
+  let i 1
+  update_people_status
+  
+  
+  ; Deliberative layer: re-evaluate destination once before the movement loop.
+  ; Placed here so replanning happens once per move cycle, not once per step.
+  deliberative_reroute
+
+  while [(i <= speed) and (not slip) and (not dead)] [
+    move_person
+    set i i + 1
+  ]
+end
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: update_injury_output
+; Called when a person successfully evacuates (just before die).
+; Increments the global counter for their final injury level and appends the level to injury_levels_histogram for post-run plotting.
+; Fatal agents (level 6) never evacuate, so il6 is not tracked here.
+; ---------------------------------------------------------------------------
+to update_injury_output
+  (
+    ifelse injury_level = 5 [set il5 il5 + 1]
+           injury_level = 4 [set il4 il4 + 1]
+           injury_level = 3 [set il3 il3 + 1]
+           injury_level = 2 [set il2 il2 + 1]
+           injury_level = 1 [set il1 il1 + 1]
+           injury_level = 0 [set il0 il0 + 1]
+  )
+  set injury_levels_histogram fput injury_level injury_levels_histogram
+end
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: follow_crowd
+; Movement behavior for panicking agents during irrational ticks.
+; Instead of heading toward an exit, the person follows the densest neighboring patch — mimicking herding behavior under panic.
+;
+; Rationality partially overrides panic when an exit is immediately adjacent:
+; if a gate patch is visible in the Moore neighborhood, the agent uses it regardless of panic state (proximity triggers a rational response).
+; ---------------------------------------------------------------------------
+to follow_crowd
+  update_people_status
+  if evacuated [update_injury_output die]
+  
+  ifelse any? neighbors with [(base_pcolor = red)]
+  [
+    ; Exit is adjacent — rationality overrides panic at close range
+    (ifelse any? neighbors with [(base_pcolor = red) and num_people < max_people_on_patch_exit]
+       [
+        ; Uncrowded exit nearby — move through it
+        face min-one-of neighbors with [(base_pcolor = red) and num_people < max_people_on_patch_exit] [distance myself]
+        forward 1
+        set evacuated true
+       ]
+       [
+        ; All adjacent exits are overcrowded — reroute to nearest uncrowded gate
+        set destination min-one-of all_gates with [num_people < max_people_on_patch_exit] [distance myself]
+        face destination
+       ]
+    )
+  ]
+  [
+    ; No exit adjacent — follow the crowd: move toward the most populated neighbor
+    face max-one-of neighbors with [base_pcolor = white] [num_people]
+    forward 1
+  ]
+end
+
+
+; ---------------------------------------------------------------------------
+; REPORTER: get_slip
+; Returns true with probability slipping_chance / 100, false otherwise.
+; Called in move_forward when the glass_bottles switch is enabled.
+; ---------------------------------------------------------------------------
+to-report get_slip
+  let p random 100
+  ifelse p <= slipping_chance
+    [report true]
+    [report false]
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: ignite_fire
+; Triggers the fire hazard at a single random patch chosen from fire_candidates.
+; fire_candidates is pre-computed in setup as the set of central white patches far from all exits, ensuring the fire origin maximizes disruption without immediately blocking evacuation routes.
+;
+; Sets fire_active? to true, which gates spread_fire every subsequent tick.
+; Records the ignition patch in fire_origin so spread_fire can enforce the maximum spread radius (hardcoded to 50 units).
+; ---------------------------------------------------------------------------
+to ignite_fire
+  set fire_active? true
+  ask one-of fire_candidates [
+    set on_fire? true
+    set fire_origin self          ; NEW: memorize ignition point
+    set fire_patches (patch-set fire_patches self)
+    sprout-fire-turtles 1 [
+      set shape "square"
+      set color orange
+      set size 1.5
+    ]
+  ]
+end
+
+
+
+; ---------------------------------------------------------------------------
+; PROCEDURE: spread_fire
+; Called every tick once fire_active? is true. Handles four responsibilities:
+;   1. PROPAGATION    — fire expands to adjacent white patches stochastically
+;   2. ANIMATION      — fire-turtle colors oscillate to simulate flickering flames
+;   3. SMOKE          — smoke diffuses outward from fire, decays over time, and is visualized as a gray tint on white patches
+;   4. PEOPLE EFFECTS — fire and smoke damage health; dense smoke disorients agents
+; ---------------------------------------------------------------------------
+to spread_fire
+  ; --- PROPAGATION ---
+  ; Each burning patch attempts to ignite its four orthogonal white neighbors.
+  ; Two conditions must both be satisfied:
+  ;   (a) the candidate patch is within 50 units of fire_origin (radius cap)
+  ;   (b) a random draw falls below fire_spread_rate (stochastic spread)
+  ; This models a Probabilistic Cellular Automaton (PCA) with bounded growth.
+  ask fire_patches [
+    ask neighbors4 with [base_pcolor = white and not on_fire?] [
+      if (distance fire_origin <= 50) and
+         (random-float 1.0 < fire_spread_rate) [
+        set on_fire? true
+        set fire_patches (patch-set fire_patches self)
+        sprout-fire-turtles 1 [
+          set shape "square"
+          set color orange
+          set size 1.5
+        ]
+      ]
+    ]
+  ]
+
+  ; --- VISUAL ANIMATION ---
+  ; Randomly shift each fire-turtle's color among orange, red and yellow variants every tick to simulate flickering flames.
+  ask fire-turtles [
+    set color one-of (list orange red (orange + 2) (red - 2) (yellow - 2))
+  ]
+
+  ; --- SMOKE DIFFUSION AND VISUALIZATION (every 3 ticks) ---
+  ; Smoke is modeled as a scalar field that diffuses by neighbor contagion rather than by in-radius scanning, giving O(white patches) cost per update.
+  if (ticks mod 3 = 0) [
+
+    ; Step 1 — emission: each burning patch sets its smoke level to the maximum
+    ask fire_patches [
+      set smoke_level smoke_radius
+    ]
+
+    ; Step 2 — diffusion: smoke spreads to neighboring white non-burning patches with a 40% decay per step (each neighbor receives 60% of the sender's level).
+    ; A neighbor only updates if the diffused value exceeds its current level, preventing smoke from flowing back toward the source.
+    ask patches with [base_pcolor = white and not on_fire? and smoke_level > 0] [
+      ask neighbors4 with [base_pcolor = white and not on_fire?] [
+        let diffused [smoke_level] of myself * 0.6
+        if diffused > smoke_level [
+          set smoke_level diffused
+        ]
+      ]
+    ]
+
+    ; Step 3 — dissipation: smoke naturally decays by 15% each update cycle.
+    ; Levels below 0.05 are zeroed out to avoid accumulating near-zero values.
+    ask patches with [base_pcolor = white and not on_fire? and smoke_level > 0] [
+      set smoke_level smoke_level * 0.85
+      if smoke_level < 0.05 [ set smoke_level 0 ]
+    ]
+
+    ; Step 4 — visualization: tint smoky patches with a gray shade proportional to smoke density. 
+    ; Only patches that currently have smoke or that previously had smoke are updated, skipping the rest.
+    ask patches with [base_pcolor = white and (smoke_level > 0 or pcolor != base_pcolor)] [
+      ifelse smoke_level > 0 and not on_fire? [
+        let intensity clamp (smoke_level / smoke_radius) 0 0.75
+        set pcolor rgb (round (255 - (intensity * 180)))
+                       (round (255 - (intensity * 180)))
+                       (round (255 - (intensity * 160)))
+      ][
+        if not on_fire? [ set pcolor base_pcolor ]
+      ]
+    ]
+  ]
+
+  ; --- EFFECTS ON PEOPLE ---
+  ; Applied every tick to all alive agents, regardless of escaping status, since pre-alarm wanderers can also be caught by a delayed fire.
+  ask people with [not dead] [
+    let here_burning?    [on_fire?]    of patch-here
+    let here_smoke_level [smoke_level] of patch-here
+
+    ; Direct fire damage: standing on a burning patch causes full fire_damage_rate health loss per tick — the most severe exposure level.
+    if here_burning? [
+      set health_state health_state - fire_damage_rate
+    ]
+
+    ; Smoke inhalation damage: reduced to 30% of fire_damage_rate, scaled by local smoke density relative to the maximum (smoke_radius).
+    ; Only applied on non-burning patches to avoid double-counting.
+    if (here_smoke_level > 0) and (not here_burning?) [
+      set health_state health_state - (fire_damage_rate * 0.3 * here_smoke_level / smoke_radius)
+    ]
+
+    ; Visibility impairment: dense smoke above smoke_visibility_threshold causes probabilistic disorientation (40% chance per tick). 
+    ; The agent loses their current exit heading and is redirected to a random gate.
+    ; The effect is per-tick and non-permanent: agents who leave the smoke zone will have their destination corrected by deliberative_reroute.
+    if (here_smoke_level >= smoke_visibility_threshold) and (escaping) [
+      if random-float 1.0 < 0.4 [
+        set destination one-of all_gates
+        face destination
+      ]
+    ]
+
+    if health_state < 0 [ set health_state 0 ]
+  ]
+end
+
+
+; ---------------------------------------------------------------------------
+; REPORTER: clamp [x lo hi]
+; Returns x constrained to the closed interval [lo, hi].
+; Used by spread_fire to keep smoke visualization intensity in [0, 0.75].
+; ---------------------------------------------------------------------------
+to-report clamp [x lo hi]
+  report max (list lo (min list hi x))
+end]]></code>
+  <widgets>
+    <view x="567" wrappingAllowedX="false" y="3" frameRate="30.0" minPycor="-350" height="705" showTickCounter="true" patchSize="1.0" fontSize="10" wrappingAllowedY="false" width="337" tickCounterLabel="ticks" maxPycor="350" updateMode="0" maxPxcor="166" minPxcor="-166"></view>
+    <plot x="1134" autoPlotX="true" yMax="10.0" autoPlotY="true" y="1" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="349" xAxis="time" display="Evacuation Time">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="evacuation time" color="-8630108" legend="true">
+        <setup></setup>
+        <update><![CDATA[let evac_people people with [evacuated]
+if any? evac_people[
+   let m mean [evac_time] of evac_people
+   if m > 0 [plot m]
+]]]></update>
+      </pen>
+    </plot>
+    <plot x="1135" autoPlotX="true" yMax="1.1" autoPlotY="true" y="180" xMin="0.0" height="190" legend="true" xMax="10.0" yMin="0.0" width="347" display="Injury Levels">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="minor" color="-5509967" legend="true">
+        <setup></setup>
+        <update><![CDATA[if (alarm? = true) and (people_left > 0) [plot il1]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="moderate" color="-11221820" legend="true">
+        <setup></setup>
+        <update><![CDATA[if (alarm? = true) and (people_left > 0) [plot il2]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="serious" color="-14454117" legend="true">
+        <setup></setup>
+        <update><![CDATA[if (alarm? = true) and (people_left > 0) [plot il3]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="severe" color="-1184463" legend="true">
+        <setup></setup>
+        <update><![CDATA[if (alarm? = true) and (people_left > 0) [plot il4]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="critical" color="-955883" legend="true">
+        <setup></setup>
+        <update><![CDATA[if (alarm? = true) and (people_left > 0) [plot il5]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="fatal" color="-2674135" legend="true">
+        <setup></setup>
+        <update><![CDATA[if (alarm? = true) and (people_left > 0) [plot count people with [dead]]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="healthy" color="-11085214" legend="true">
+        <setup></setup>
+        <update><![CDATA[if (alarm? = true) and (people_left > 0) [plot il0]]]></update>
+      </pen>
+    </plot>
+    <plot x="1135" autoPlotX="true" yMax="5.0" autoPlotY="true" y="374" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="348" xAxis="time" display="Evacuation Speed">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="evacuation speed" color="-13840069" legend="true">
+        <setup></setup>
+        <update>if alarm? = true [plot count people with [evacuated]]</update>
+      </pen>
+    </plot>
+    <plot x="1135" autoPlotX="true" yMax="5.0" autoPlotY="true" yAxis="m/s" y="554" xMin="0.0" height="140" legend="false" xMax="10.0" yMin="0.0" width="346" xAxis="time" display="Average Speed">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-14835848" legend="true">
+        <setup></setup>
+        <update><![CDATA[ if (count people > 0) and (alarm? = true) [plot mean [speed] of people]]]></update>
+      </pen>
+    </plot>
+    <monitor x="994" precision="17" y="5" height="60" fontSize="11" width="134" display="Evacuation time">time_of_evacuation</monitor>
+    <button x="16" y="9" height="47" disableUntilTicks="false" forever="false" kind="Observer" width="81" display="SETUP">setup</button>
+    <slider x="16" step="1" y="79" max="100" width="150" display="aware_fraction" height="50" min="0" direction="Horizontal" default="50.0" variable="aware_fraction"></slider>
+    <slider x="16" step="1" y="151" max="100" width="150" display="adult_fraction" height="50" min="0" direction="Horizontal" default="100.0" variable="adult_fraction"></slider>
+    <slider x="16" step="1" y="206" max="100 - adult_fraction" width="150" display="elderly_fraction" height="50" min="0" direction="Horizontal" default="4.0" variable="elderly_fraction"></slider>
+    <switch x="16" y="428" height="40" on="false" variable="fire_hazard_enabled" width="147" display="fire_hazard_enabled"></switch>
+    <slider x="171" step="0.10" y="428" max="1" width="150" display="fire_spread_rate" height="50" min="0" direction="Horizontal" default="0.2" variable="fire_spread_rate"></slider>
+    <slider x="325" step="10" y="428" max="100" width="150" display="fire_delay" height="50" min="0" direction="Horizontal" default="10.0" variable="fire_delay"></slider>
+    <slider x="175" step="1" y="150" max="100" width="150" display="female_fraction" height="51" min="0" direction="Horizontal" default="0.0" variable="female_fraction"></slider>
+    <slider x="175" step="1" y="79" max="100" width="150" display="panic_fraction" height="50" min="0" direction="Horizontal" default="50.0" variable="panic_fraction"></slider>
+    <button x="191" y="9" height="48" disableUntilTicks="false" forever="true" kind="Observer" width="165" display="START SIMULATION">start_simulation</button>
+    <button x="102" y="9" height="48" disableUntilTicks="false" forever="false" kind="Observer" width="83" display="ALARM">start_evacuation</button>
+    <slider x="175" step="1" y="207" max="100 - adult_fraction - elderly_fraction" width="150" display="children_fraction" height="50" min="0" direction="Horizontal" default="2.0" variable="children_fraction"></slider>
+    <monitor x="920" precision="17" y="108" height="60" fontSize="11" width="100" display="Healthy">il0</monitor>
+    <monitor x="921" precision="17" y="175" height="60" fontSize="11" width="100" display="Minor">il1</monitor>
+    <monitor x="922" precision="17" y="244" height="60" fontSize="11" width="100" display="Serious">il3</monitor>
+    <monitor x="922" precision="17" y="313" height="60" fontSize="11" width="100" display="Critical">il5</monitor>
+    <monitor x="1029" precision="17" y="313" height="60" fontSize="11" width="100" display="Fatal">count people with [dead]</monitor>
+    <monitor x="1029" precision="17" y="243" height="60" fontSize="11" width="100" display="Severe">il4</monitor>
+    <monitor x="1029" precision="17" y="175" height="60" fontSize="11" width="100" display="Moderate">il2</monitor>
+    <monitor x="1029" precision="17" y="108" height="60" fontSize="11" width="100" display="Evacuated">population - count people</monitor>
+    <slider x="16" step="1" y="484" max="15" width="150" display="fire_damage_rate" height="50" min="0" direction="Horizontal" default="3.0" variable="fire_damage_rate"></slider>
+    <slider x="173" step="0.1" y="487" max="3.0" width="150" display="smoke_visibility_threshold" height="50" min="0.1" direction="Horizontal" default="0.8" variable="smoke_visibility_threshold"></slider>
+    <slider x="328" step="1" y="486" max="25" width="150" display="smoke_radius" height="50" min="1" direction="Horizontal" default="25.0" variable="smoke_radius"></slider>
+    <input x="16" multiline="false" y="278" height="60" variable="injury_weight" type="number" width="100">0.1365</input>
+    <input x="120" multiline="false" y="278" height="60" variable="population" type="number" width="100">1000.0</input>
+    <input x="224" multiline="false" y="278" height="60" variable="scale" type="number" width="100">4.0</input>
+    <input x="328" multiline="false" y="278" height="60" variable="people_dim" type="number" width="100">10.0</input>
+    <input x="433" multiline="false" y="278" height="60" variable="wall-thickness" type="number" width="100">2.5</input>
+    <switch x="434" y="360" height="40" on="false" variable="real_exits" width="127" display="real_exits"></switch>
+    <switch x="302" y="360" height="40" on="true" variable="speed_enabled" width="127" display="speed_enabled"></switch>
+    <slider x="148" step="1" y="360" max="100" width="150" display="slipping_chance" height="50" min="0" direction="Horizontal" default="5.0" variable="slipping_chance"></slider>
+    <switch x="16" y="360" height="40" on="false" variable="glass_bottles" width="126" display="glass_bottles"></switch>
+    <slider x="16" step="1" y="557" max="30" width="250" display="perception_radius" height="50" min="1" direction="Horizontal" default="15.0" variable="perception_radius"></slider>
+    <slider x="16" step="1" y="618" max="5" width="250" display="safety_weight" height="50" min="0" direction="Horizontal" default="2.0" variable="safety_weight"></slider>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="descriptive" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup
+start_evacuation</setup>
+      <go>start_simulation</go>
+      <postRun>export-plot "Evacuation Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/descriptive/evacuation_speed/evacuation_speed_run_" behaviorspace-run-number ".csv")
+export-plot "Evacuation Time" (word "C:/Users/dadpl/git/CrowdLogo/results/descriptive/evacuation_time/evacuation_time_run_" behaviorspace-run-number ".csv")
+export-plot "Average Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/descriptive/average_speed/average_speed_run_" behaviorspace-run-number ".csv")</postRun>
+      <metrics>
+        <metric>il0</metric>
+        <metric>il1</metric>
+        <metric>il2</metric>
+        <metric>il3</metric>
+        <metric>il4</metric>
+        <metric>il5</metric>
+        <metric>count people with [dead]</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="scale">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="glass_bottles">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adult_fraction">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="population">
+          <value value="30000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="elderly_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="slipping_chance">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="people_dim">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wall-thickness">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed_enabled">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="panic_fraction">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="aware_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="female_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="children_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="real_exits">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="injury_weight">
+          <value value="0.1365"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="speculative_num_people" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup
+start_evacuation</setup>
+      <go>start_simulation</go>
+      <postRun>export-plot "Evacuation Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/number_of_people/evacuation_speed/evacuation_speed_run_" behaviorspace-run-number ".csv")
+export-plot "Evacuation Time" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/number_of_people/evacuation_time/evacuation_time_run_" behaviorspace-run-number ".csv")
+export-plot "Average Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/number_of_people/average_speed/average_speed_run_" behaviorspace-run-number ".csv")</postRun>
+      <metrics>
+        <metric>il0</metric>
+        <metric>il1</metric>
+        <metric>il2</metric>
+        <metric>il3</metric>
+        <metric>il4</metric>
+        <metric>il5</metric>
+        <metric>count people with [dead]</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="scale">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="glass_bottles">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adult_fraction">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="population">
+          <value value="30000"></value>
+          <value value="27500"></value>
+          <value value="25000"></value>
+          <value value="22500"></value>
+          <value value="20000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="elderly_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="slipping_chance">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="people_dim">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wall-thickness">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed_enabled">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="panic_fraction">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="aware_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="female_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="children_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="real_exits">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="injury_weight">
+          <value value="0.1365"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="speculative_aware_fraction" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup
+start_evacuation</setup>
+      <go>start_simulation</go>
+      <postRun>export-plot "Evacuation Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/aware_fraction/evacuation_speed/evacuation_speed_run_" behaviorspace-run-number ".csv")
+export-plot "Evacuation Time" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/aware_fraction/evacuation_time/evacuation_time_run_" behaviorspace-run-number ".csv")
+export-plot "Average Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/aware_fraction/average_speed/average_speed_run_" behaviorspace-run-number ".csv")</postRun>
+      <metrics>
+        <metric>il0</metric>
+        <metric>il1</metric>
+        <metric>il2</metric>
+        <metric>il3</metric>
+        <metric>il4</metric>
+        <metric>il5</metric>
+        <metric>count people with [dead]</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="scale">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="glass_bottles">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adult_fraction">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="population">
+          <value value="30000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="elderly_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="slipping_chance">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="people_dim">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wall-thickness">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed_enabled">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="panic_fraction">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="aware_fraction">
+          <value value="50"></value>
+          <value value="60"></value>
+          <value value="70"></value>
+          <value value="80"></value>
+          <value value="90"></value>
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="female_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="children_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="real_exits">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="injury_weight">
+          <value value="0.1365"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="speculative_accessible_exits" repetitions="3" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup
+start_evacuation</setup>
+      <go>start_simulation</go>
+      <postRun>export-plot "Evacuation Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/accessible_exits/evacuation_speed/evacuation_speed_run_" behaviorspace-run-number ".csv")
+export-plot "Evacuation Time" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/accessible_exits/evacuation_time/evacuation_time_run_" behaviorspace-run-number ".csv")
+export-plot "Average Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/accessible_exits/average_speed/average_speed_run_" behaviorspace-run-number ".csv")</postRun>
+      <metrics>
+        <metric>il0</metric>
+        <metric>il1</metric>
+        <metric>il2</metric>
+        <metric>il3</metric>
+        <metric>il4</metric>
+        <metric>il5</metric>
+        <metric>count people with [dead]</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="scale">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="glass_bottles">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adult_fraction">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="population">
+          <value value="30000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="elderly_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="slipping_chance">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="people_dim">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wall-thickness">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed_enabled">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="panic_fraction">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="aware_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="female_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="children_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="real_exits">
+          <value value="true"></value>
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="injury_weight">
+          <value value="0.1365"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="speculative_glass_bottles" repetitions="3" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup
+start_evacuation</setup>
+      <go>start_simulation</go>
+      <postRun>export-plot "Evacuation Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/glass_bottles/evacuation_speed/evacuation_speed_run_" behaviorspace-run-number ".csv")
+export-plot "Evacuation Time" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/glass_bottles/evacuation_time/evacuation_time_run_" behaviorspace-run-number ".csv")
+export-plot "Average Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/glass_bottles/average_speed/average_speed_run_" behaviorspace-run-number ".csv")</postRun>
+      <metrics>
+        <metric>il0</metric>
+        <metric>il1</metric>
+        <metric>il2</metric>
+        <metric>il3</metric>
+        <metric>il4</metric>
+        <metric>il5</metric>
+        <metric>count people with [dead]</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="scale">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="glass_bottles">
+          <value value="true"></value>
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adult_fraction">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="population">
+          <value value="30000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="elderly_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="slipping_chance">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="people_dim">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wall-thickness">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed_enabled">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="panic_fraction">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="aware_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="female_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="children_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="real_exits">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="injury_weight">
+          <value value="0.1365"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="speculative_panic_fraction" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup
+start_evacuation</setup>
+      <go>start_simulation</go>
+      <postRun>export-plot "Evacuation Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/panic_fraction/evacuation_speed/evacuation_speed_run_" behaviorspace-run-number ".csv")
+export-plot "Evacuation Time" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/panic_fraction/evacuation_time/evacuation_time_run_" behaviorspace-run-number ".csv")
+export-plot "Average Speed" (word "C:/Users/dadpl/git/CrowdLogo/results/speculative/panic_fraction/average_speed/average_speed_run_" behaviorspace-run-number ".csv")</postRun>
+      <metrics>
+        <metric>il0</metric>
+        <metric>il1</metric>
+        <metric>il2</metric>
+        <metric>il3</metric>
+        <metric>il4</metric>
+        <metric>il5</metric>
+        <metric>count people with [dead]</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="scale">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="glass_bottles">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adult_fraction">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="population">
+          <value value="30000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="elderly_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="slipping_chance">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="people_dim">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wall-thickness">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="speed_enabled">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="panic_fraction">
+          <value value="0"></value>
+          <value value="10"></value>
+          <value value="20"></value>
+          <value value="30"></value>
+          <value value="40"></value>
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="aware_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="female_fraction">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="children_fraction">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="real_exits">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="injury_weight">
+          <value value="0.1365"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
