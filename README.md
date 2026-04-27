@@ -53,15 +53,15 @@ From this continuous value, the model derives a discrete injury level from 0 to 
 
 ### Sources of Damage
 
-# 1. Crowding
+#### 1. Crowding
 
 Crowding is the main source of harm in the simulation. At each tick, an agent loses health proportionally to the number of other alive agents occupying the same patch, scaled by a global injury weight parameter.
 
-# 2. Broken Glass
+#### 2. Broken Glass
 
 When enabled, the floor is partially treated as covered with broken glass. At each movement step, agents can slip with probability `slipping_chance / 100`; if they slip, they lose 5% of their current health and do not move during that step.
 
-# 3. Fire and Smoke
+#### 3. Fire and Smoke
 
 When the fire hazard is enabled, a fire starts after a configurable delay and spreads stochastically using a probabilistic cellular automaton.
 
