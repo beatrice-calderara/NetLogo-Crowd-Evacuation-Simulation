@@ -1,6 +1,4 @@
-# NetLogo-Crowd-Evacuation-Simulation
-
-# Crowd Evacuation Simulation
+# NetLogo Crowd Evacuation Simulation
 
 Agent-Based Model in NetLogo for simulating crowd evacuation during mass-event emergencies, with a focus on congestion, panic behavior, injuries, and environmental hazards. The project explores how individual behavior and arena conditions affect evacuation time, safety, and mortality.
 
